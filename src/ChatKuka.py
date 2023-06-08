@@ -3,12 +3,14 @@ import pybullet as pb
 import numpy as np
 import optas
 import sys
-from time import sleep,perf_counter
+from time import sleep,perf_counter, time
 import threading
 import multiprocessing as mp
 from scipy.spatial.transform import Rotation as Rot
+import math
 
 import re
+from optas.spatialmath import *
 
 
 class VisualBox:
@@ -40,87 +42,101 @@ class Controller:
 
     def __init__(self, dt):
         self.response_gain = 0.4
-        ee_link = 'storz_tilt_endoscope_link_cm_optical'
+        link_ee = 'storz_tilt_endoscope_link_cm_optical'
         T = 2
-        robot = optas.RobotModel(urdf_filename='resources/lbr_with_tilt_endoscope.urdf', time_derivs=[0, 1])
-        name = robot.get_name()
-        robot.add_base_frame('pybullet_world', [1, 0, 0])
-        builder = optas.OptimizationBuilder(T, robots=robot)
-        qc = builder.add_parameter('qc', robot.ndof)
-        box_pos = builder.add_parameter('box_pos', 3)
-        insertion_depth = builder.add_parameter('depth', 1)
-        axis_align = builder.add_parameter('axis_align', 3)
-        # response = builder.add_parameter('response', 3)
-        eff_goal = box_pos + insertion_depth*axis_align
-        q0 = builder.get_model_state(name, 0)
-        dq = builder.get_model_state(name, 0, time_deriv=1)
-        qF = builder.get_model_state(name, 1)
-        builder.add_equality_constraint('initial', q0, qc)
-        builder.add_equality_constraint('dynamics', q0 + dt*dq, qF)
-        builder.enforce_model_limits(name)
+        kuka = optas.RobotModel(urdf_filename='resources/lbr_with_tilt_endoscope.urdf', time_derivs=[1])
+        kuka_name = kuka.get_name()
+        kuka.add_base_frame('pybullet_world', [1, 0, 0])
+        self.kuka_name =kuka_name
+        
+        
+        # box_pos = builder.add_parameter('box_pos', 3)
+        # insertion_depth = builder.add_parameter('depth', 1)
+        # axis_align = builder.add_parameter('axis_align', 3)
 
-        pc = robot.get_global_link_position(ee_link, qc)
+        T = 1
+        builder = optas.OptimizationBuilder(T, robots=[kuka], derivs_align=True)
+        # Setup parameters
+        qc = builder.add_parameter("qc", kuka.ndof)  # current robot joint configuration
+        pg = builder.add_parameter("pg", 7)
 
-        TfF = robot.get_global_link_transform(ee_link, qF)
-        pF = TfF[:3, 3]
-        zF = TfF[:3, 2]
+        # Get joint velocity
+        dq = builder.get_model_state(kuka_name, t=0, time_deriv=1)
 
-        # Minimize distance from end-effector position to trocar axis
-        alpha = optas.dot(pF - box_pos, axis_align)
-        dist_to_axis_align_sq = optas.sumsqr(box_pos + alpha*axis_align - pF)
-        builder.add_cost_term('dist_to_axis_align', 1e3*dist_to_axis_align_sq)
+        # Get next joint state
+        q = qc + dt * dq
 
-        # Minimize distance between end-effector position and goal
-        dist_to_goal_sq = optas.sumsqr(eff_goal - pF)
-        task_weight = 1.  # TODO: consider dyanmic weight (i.e. weight becomes stronger when dist to axis align is smaller)
-        alpha = optas.dot(pc - box_pos, axis_align)
-        dist_to_axis_align_sq = optas.sumsqr(box_pos + alpha*axis_align - pc)
-        task_weight = optas.exp(-dist_to_axis_align_sq**2) # TODO: does this need to be squared?
-        builder.add_cost_term('dist_to_goal', 50.*task_weight*dist_to_goal_sq)
+        # Get jacobian
+        J = kuka.get_global_link_geometric_jacobian(link_ee, qc)
 
-        # Align end-effector with trocar axis
-        builder.add_cost_term('eff_axis_align', 50.*optas.sumsqr(zF - axis_align))
+        # Get end-effector velocity
+        dp = J @ dq
 
-        # Minimize joint velocity
-        W = 0.1*optas.diag([7, 6, 5, 4, 3, 2, 1])
-        builder.add_cost_term('min_dq', dq.T@W@dq)
+        # Get current end-effector position
+        pc = kuka.get_global_link_position(link_ee, qc)
+        Rc = kuka.get_global_link_rotation(link_ee, qc)
 
-        # Reduce interaction forces
-        delta = 0.5
-        pR = pc #+ delta*response
-        builder.add_cost_term('reduce_interaction', 100*optas.sumsqr(pF - pR))
+        print("dp = {0}".format(dp.size()))
+        Om = skew(dp[3:])
 
+        # Get next end-effector position (Global)
+        p = pc + dt * dp[:3]
+        R = (Om * dt + I3()) @ Rc
+
+        # Get next end-effector position (Current end-effector position)
+
+        p = Rc.T @ dt @ dp[:3]
+        R = Rc.T @ (Om * dt + I3())
+
+        # Cost: match end-effector position
+        Rotq = Quaternion(pg[3], pg[4], pg[5], pg[6])
+        Rg = Rotq.getrotm()
+
+        pg_ee = -Rc.T @ pc + Rc.T @ pg[:3]
+        Rg_ee = Rc.T @ Rg
+
+        diffp = p - pg_ee[:3]
+        diffR = Rg_ee.T @ R
+
+        W_p = optas.diag([1e3, 1e3, 1e3])
+        builder.add_cost_term("match_p", diffp.T @ W_p @ diffp)
+
+        w_dq = 0.01
+        builder.add_cost_term("min_dq", w_dq * optas.sumsqr(dq))
+
+        w_ori = 1e1
+        builder.add_cost_term("match_r", w_ori * optas.sumsqr(diffR - I3()))
+
+        builder.add_leq_inequality_constraint("eff_x", diffp[0] * diffp[0], 1e-6)
+        builder.add_leq_inequality_constraint("eff_y", diffp[1] * diffp[1], 1e-8)
+        builder.add_leq_inequality_constraint("eff_z", diffp[2] * diffp[2], 1e-8)
+        # opts = {'qpsol': {'printLevel': 'none'}}
+        opts = {"print_status": False,"print_out": False,"print_in": False,"print_header": False,"print_time": False,"print_iteration": False,"print":False}
+        optimization = builder.build()
+        # optimization.set_options(opts)
+        # optas.set_print_level(0)
+        # optas.print_options()
+        # self.solver = optas.CasADiSolver(optimization).setup("sqpmethod", opts)
         self.solver = optas.ScipyMinimizeSolver(builder.build()).setup('SLSQP')
-        self.name = name
-        self.solution = None
 
-        c = optas.sumsqr(pF - eff_goal)
-        self._finish_criteria = optas.Function('finish', [qF, box_pos, axis_align], [c])
 
-    def finish_criteria(self, q, bp, z):
-        tol = 0.005**2
-        f = self._finish_criteria(q, bp, z)
-        return f < tol
+    # def finish_criteria(self, q, bp, z):
+    #     tol = 0.005**2
+    #     f = self._finish_criteria(q, bp, z)
+    #     return f < tol
 
-    def __call__(self, qc, bp, z, d):
+    def __call__(self, qc, pg):
 
         # resp = self.response_gain*f
         # print(resp)
-        if self.solution is not None:
-            self.solver.reset_initial_seed(self.solution)
-        else:
-            self.solver.reset_initial_seed({f'{self.name}/q': optas.horzcat(qc, qc)})
-        self.solver.reset_parameters({'qc': qc, 'box_pos': bp, 'axis_align': z, 'depth':d})
-        t0 = perf_counter()
-        self.solution = self.solver.solve()
-        t1 = perf_counter()
-        dur = t1 - t0
-        self.dur = dur
-        # print(f"-------\nSolver duration (s, hz): {dur}, {1/dur}")
-        return self.solution[f'{self.name}/q'][:, -1].toarray().flatten()
+        # output_file = "qpoases_output.txt"
+        self.solver.reset_parameters({"qc": optas.DM(qc), "pg": optas.DM(pg)})
+        # with open(output_file, "w") as f:
+            # sys.stdout = f
+        solution = self.solver.solve()
 
-    def get_solver_duration(self):
-        return self.dur
+        return solution[f"{self.kuka_name}/dq"].toarray().flatten()
+
 
 
 class Robot:
@@ -246,7 +262,8 @@ class HRI:
         self.manager = mp.Manager()
         self.shared_dict = self.manager.dict()
 
-        self.depth = 0.3
+        self.depth = 0.1
+        self.lock = threading.Lock()
         with open(key_path, 'r') as file:
             self.key = file.read()
         
@@ -286,12 +303,12 @@ class HRI:
         time_step = 1./float(sampling_freq)
         pb.setTimeStep(time_step)
 
-        box_base_position = np.array([0.35, -0.2, 0.2])
+        box_base_position = np.array([0.4, 0.4, 0.2])
 
         pb.resetDebugVisualizerCamera(
             cameraDistance=0.2,
-            cameraYaw=-40,
-            cameraPitch=30,
+            cameraYaw=0,
+            cameraPitch=20,
             cameraTargetPosition=box_base_position,
         )
         pb.configureDebugVisualizer(pb.COV_ENABLE_GUI, 0)
@@ -310,14 +327,14 @@ class HRI:
 
         # environment setup
         box_half_extents = [0.01, 0.01, 0.01]
-        constdist = optas.np.array([0.0, 0.0, -0.04])
+        # constdist = optas.np.array([0.0, 0.0, -0.04])
         box_id1 = VisualBox(
-            base_position=init_pos + constdist,
+            base_position=init_pos ,
             half_extents=box_half_extents,
         )
 
         box_id2 = VisualBox(
-            base_position=np.array([-0.3,-0.3,0.3]) + constdist,
+            base_position=np.array([-0.3,-0.3,0.3]) ,
             half_extents=box_half_extents,
         )
 
@@ -345,14 +362,49 @@ class HRI:
 
         # loop for robotic simulation
         # while(pb.isConnected() and self.isLoopRun):
+        start_time = time()
         print("Run into robot_loop")
+        pginit = optas.np.array([0.4, 0.0, 0.06, 0.0, 1.00, 0.0, 0.0])
+        # pginit = optas.np.array([float(init_pos[0]), float(init_pos[1]), float(init_pos[2]), 0.0, 1.00, 0.0, 0.0])
         while True:
-            box_base_position, box_base_orientation = HRI.get_box_pose(box_id)
-            R_box = Rot.from_quat(box_base_orientation).as_matrix()
+            t = time() - start_time
+            # if t > Tmax_start:
+            #     break
+            # box.reset(
+            #     base_position=constdist)
+            # base_orientation=yaw2quat(state[2]).toarray().flatten(),
+            # )
+            nv = 1.0
+            pginit1 = pginit + optas.np.array(
+                    [
+                        0.03 * optas.np.sin(2 * math.pi * nv * t),
+                        0.03 * optas.np.cos(2 * math.pi * nv * t),
+                        0.00 * math.pi * t,
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                    ]
+                )
+            
 
-            goal_z = -R_box[:3, 1]
+            pb.resetBasePositionAndOrientation(
+                box_id._id,
+                 pginit1[:3],
+                pginit1[3:],
+            )
+            # box_base_position, box_base_orientation = HRI.get_box_pose(box_id)
+            # R_box = Rot.from_quat(box_base_orientation).as_matrix()
 
-            q = controller(q, box_base_position, goal_z, self.depth)
+            # goal_z = -R_box[:3, 1]
+            self.lock.acquire()
+            try:
+                pginit1[2] += self.depth
+                dqgoal = controller(q, pginit1)
+            finally:
+                self.lock.release()
+
+            q += time_step * dqgoal
             robot.cmd(q)
 
             pb.stepSimulation()
@@ -381,22 +433,16 @@ class HRI:
             # chat_history.append(user_input)
             conversation_history += f"User: {user_input}\nAssistant: "
             response = chat_with_gpt(conversation_history)
+            # sys.stdout = sys.__stdout__
+            # sys.stdout = original_stdout
             print("ChatGPT: " + response)
 
             match = re.search(pattern, response)
             if match:
+                self.lock.acquire()
                 self.depth = float(match.group(1))
                 print("Robot: Command has been sent")
-
-
-
-
-
-            
-            
-
-
-
+                self.lock.release()
 
 
 
