@@ -239,7 +239,7 @@ class Robot:
 
 
 class HRI:
-    def __init__(self):
+    def __init__(self,key_path):
         # self.thread_rob = threading.Thread(target=self.robot_loop)
 
         # self.thread_hri = threading.Thread(target=self.hri_loop)
@@ -247,6 +247,9 @@ class HRI:
         self.shared_dict = self.manager.dict()
 
         self.depth = 0.3
+        with open(key_path, 'r') as file:
+            self.key = file.read()
+        
     
     @ staticmethod
     def get_box_pose(box, noise=0.005):
@@ -360,14 +363,11 @@ class HRI:
 
     def hri_loop(self):
         # Provide your OpenAI API key
-        openai.api_key = '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'
-
+        openai.api_key = self.key
         pattern = r"@{(-?\d+\.\d+)}"
         print("Here is chatgpt Thread")
-        pre_command = "assume you are a robotic controller, when I tell you move closer to my target. \
-        You directly give me a sentence like \"0.5\". No explains, only you can reply is a number from -1.0 to 1.0.\
-        Further means number close to 1.0 or -1.0. Closer means number close to 1.0\
-        if I say \"send it\", you need to output the number in such format: @{0.3}"
+        pre_command = 'assume you are a robotic controller, when I tell you move closer to my target. You directly give me a sentence like \"0.5\". No explains, only you can reply is a number from -1.0 to 1.0.\
+        Further means number close to 1.0 or -1.0. Closer means number close to 1.0. if I say \"send it\", you need to output the number in such format: @{0.3}'
         conversation_history = ""
         conversation_history += f"User: {pre_command}\nAssistant: "
 
@@ -419,8 +419,8 @@ def main():
 
     # setup pybullet
     
-
-    instance = HRI()
+    key_path = sys.argv[1]
+    instance = HRI(key_path)
     instance.run()
 
 
